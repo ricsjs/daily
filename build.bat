@@ -10,14 +10,15 @@ if not exist ".venv-build\Scripts\python.exe" (
 set PY=.venv-build\Scripts\python.exe
 
 echo Instalando PyInstaller e Pillow...
-%PY% -m pip install -q --upgrade pip pyinstaller pillow || goto erro
+%PY% -m pip install -q --upgrade pip pyinstaller pillow tzdata || goto erro
 
 echo Gerando icone...
 %PY% gerar_icone.py || goto erro
 
 echo Empacotando...
 %PY% -m PyInstaller --noconfirm --clean --onefile --windowed ^
-    --name Daily --icon daily.ico --exclude-module PIL daily.pyw || goto erro
+    --name Daily --icon daily.ico --exclude-module PIL ^
+    --hidden-import tzdata --collect-data tzdata daily.pyw || goto erro
 
 echo.
 echo Pronto: %~dp0dist\Daily.exe

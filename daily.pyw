@@ -8,16 +8,21 @@ Uso:
     pythonw daily.pyw --startup  abre só o widget (usado ao ligar o PC)
 """
 
+import calendar
 import ctypes
 import datetime as dt
+import hashlib
 import json
 import os
 import queue
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.request
 import uuid
 import tkinter as tk
 from tkinter import colorchooser, messagebox, simpledialog
@@ -27,7 +32,17 @@ try:
 except ImportError:  # fora do Windows
     winreg = None
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
+
 APP_NOME = "Daily"
+VERSAO = "1.0.0"  # aumente antes de gerar uma release nova (tag v1.0.1, v1.1.0...)
+REPO_GITHUB = "ricsjs/daily"
+NOME_ASSET = "Daily.exe"  # nome do arquivo anexado na release
+URL_RELEASES = os.environ.get("DAILY_URL_RELEASES") or \
+    f"https://api.github.com/repos/{REPO_GITHUB}/releases/latest"
 EMPACOTADO = getattr(sys, "frozen", False)  # rodando como .exe (PyInstaller)
 
 
@@ -223,6 +238,463 @@ def definir_autostart(ativar):
                 winreg.DeleteValue(k, APP_NOME)
             except FileNotFoundError:
                 pass
+
+
+# ------------------------------------------------- Google Agenda (iCal, leitura)
+
+DIAS_ICS = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+
+
+def _ics_linhas(texto):
+    """Junta as linhas "dobradas" do iCal (continuação começa com espaço/tab)."""
+    linhas = []
+    for l in texto.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if l[:1] in (" ", "\t") and linhas:
+            linhas[-1] += l[1:]
+        elif l:
+            linhas.append(l)
+    return linhas
+
+
+def _ics_texto(v):
+    return re.sub(r"\\([\\,;nN])", lambda m: "\n" if m[1] in "nN" else m[1], v)
+
+
+def _ics_data(valor, params):
+    """Data (dia inteiro) ou datetime ingênuo no fuso local do PC."""
+    valor = valor.strip()
+    if params.get("VALUE") == "DATE" or len(valor) == 8:
+        return dt.date(int(valor[:4]), int(valor[4:6]), int(valor[6:8]))
+    ingenuo = dt.datetime.strptime(valor[:15], "%Y%m%dT%H%M%S")
+    if valor.endswith("Z"):
+        return ingenuo.replace(tzinfo=dt.timezone.utc).astimezone().replace(tzinfo=None)
+    tzid = params.get("TZID")
+    if tzid and ZoneInfo is not None:
+        try:
+            return ingenuo.replace(tzinfo=ZoneInfo(tzid)).astimezone().replace(tzinfo=None)
+        except Exception:
+            pass  # sem base de fusos: usa o horário "de parede"
+    return ingenuo
+
+
+def _ics_duracao(v):
+    m = re.fullmatch(r"([+-])?P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?", v.strip())
+    if not m:
+        return dt.timedelta(0)
+    sem, d, h, mi, s = (int(x or 0) for x in m.groups()[1:])
+    td = dt.timedelta(weeks=sem, days=d, hours=h, minutes=mi, seconds=s)
+    return -td if m[1] == "-" else td
+
+
+def _como_datetime(x):
+    return x if isinstance(x, dt.datetime) else dt.datetime.combine(x, dt.time())
+
+
+def _chave_ocorrencia(x):
+    return _como_datetime(x).strftime("%Y%m%d%H%M")
+
+
+def _ics_vevents(texto):
+    eventos, atual, profundidade = [], None, 0
+    for linha in _ics_linhas(texto):
+        if ":" not in linha:
+            continue
+        cab, valor = linha.split(":", 1)
+        partes = cab.split(";")
+        nome = partes[0].upper()
+        params = {}
+        for p in partes[1:]:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                params[k.upper()] = v.strip('"')
+        if nome == "BEGIN":
+            if valor.upper() == "VEVENT":
+                atual, profundidade = {"EXDATE": []}, 0
+            elif atual is not None:
+                profundidade += 1  # VALARM etc. dentro do evento
+        elif nome == "END":
+            if atual is not None and valor.upper() == "VEVENT":
+                eventos.append(atual)
+                atual = None
+            elif atual is not None:
+                profundidade -= 1
+        elif atual is not None and profundidade == 0:
+            if nome == "EXDATE":
+                for v in valor.split(","):
+                    try:
+                        atual["EXDATE"].append(_ics_data(v, params))
+                    except ValueError:
+                        pass
+            else:
+                atual[nome] = (params, valor)
+    return eventos
+
+
+def _dias_no_mes(ano, mes, byday, bymonthday):
+    ultimo = calendar.monthrange(ano, mes)[1]
+    res = set()
+    for d in bymonthday:
+        dd = d if d > 0 else ultimo + 1 + d
+        if 1 <= dd <= ultimo:
+            res.add(dt.date(ano, mes, dd))
+    for n, wd in byday:
+        dias = [dt.date(ano, mes, x) for x in range(1, ultimo + 1) if dt.date(ano, mes, x).weekday() == wd]
+        if n is None:
+            res.update(dias)
+        elif 0 < abs(n) <= len(dias):
+            res.add(dias[n - 1] if n > 0 else dias[n])
+    return sorted(res)
+
+
+def _expandir_rrule(inicio, regra, limite):
+    """Ocorrências (datetimes) de uma RRULE, do início até o limite. Cobre o que o Google gera."""
+    r = dict(p.split("=", 1) for p in regra.upper().split(";") if "=" in p)
+    freq = r.get("FREQ")
+    intervalo = max(1, int(r.get("INTERVAL", "1") or 1))
+    contagem = int(r["COUNT"]) if r.get("COUNT", "").isdigit() else None
+    ate = None
+    if "UNTIL" in r:
+        try:
+            u = _ics_data(r["UNTIL"], {})
+            ate = u if isinstance(u, dt.datetime) else dt.datetime.combine(u, dt.time(23, 59, 59))
+        except ValueError:
+            pass
+    byday = []
+    for item in r.get("BYDAY", "").split(","):
+        m = re.fullmatch(r"([+-]?\d+)?(MO|TU|WE|TH|FR|SA|SU)", item.strip())
+        if m:
+            byday.append((int(m[1]) if m[1] else None, DIAS_ICS[m[2]]))
+    bymonthday = [int(x) for x in r.get("BYMONTHDAY", "").split(",") if re.fullmatch(r"-?\d+", x.strip())]
+    bymonth = sorted(int(x) for x in r.get("BYMONTH", "").split(",") if x.strip().isdigit())
+    hora = inicio.time()
+    dias_mes = bymonthday or ([] if byday else [inicio.day])
+
+    def candidatos():
+        if freq == "DAILY":
+            dias_ok = {wd for _, wd in byday}
+            d = inicio
+            while True:
+                if not dias_ok or d.weekday() in dias_ok:
+                    yield d
+                d += dt.timedelta(days=intervalo)
+        elif freq == "WEEKLY":
+            wkst = DIAS_ICS.get(r.get("WKST", "MO"), 0)
+            dias = sorted({wd for _, wd in byday} or {inicio.weekday()}, key=lambda w: (w - wkst) % 7)
+            base = inicio.date() - dt.timedelta(days=(inicio.weekday() - wkst) % 7)
+            while True:
+                for wd in dias:
+                    yield dt.datetime.combine(base + dt.timedelta(days=(wd - wkst) % 7), hora)
+                base += dt.timedelta(weeks=intervalo)
+        elif freq == "MONTHLY":
+            ano, mes = inicio.year, inicio.month
+            while True:
+                for d in _dias_no_mes(ano, mes, byday, dias_mes):
+                    yield dt.datetime.combine(d, hora)
+                mes += intervalo
+                ano, mes = ano + (mes - 1) // 12, (mes - 1) % 12 + 1
+        elif freq == "YEARLY":
+            ano = inicio.year
+            while True:
+                for mes in bymonth or [inicio.month]:
+                    for d in _dias_no_mes(ano, mes, byday, dias_mes):
+                        yield dt.datetime.combine(d, hora)
+                ano += intervalo
+        else:
+            yield inicio
+
+    res, n = [], 0
+    for i, c in enumerate(candidatos()):
+        if i > 40000 or c > limite or (ate and c > ate):
+            break
+        if c < inicio:
+            continue
+        n += 1
+        if contagem and n > contagem:
+            break
+        res.append(c)
+    return res
+
+
+def eventos_ics(texto, ini, fim):
+    """Eventos do iCal que tocam o intervalo [ini, fim] (datas)."""
+    ini_dt = dt.datetime.combine(ini, dt.time())
+    fim_dt = dt.datetime.combine(fim, dt.time(23, 59, 59))
+    brutos = _ics_vevents(texto)
+    sobrescritos = set()  # ocorrências de eventos repetidos que foram editadas/canceladas
+    for ev in brutos:
+        if "RECURRENCE-ID" in ev and "UID" in ev:
+            try:
+                rid = _ics_data(ev["RECURRENCE-ID"][1], ev["RECURRENCE-ID"][0])
+                sobrescritos.add((ev["UID"][1], _chave_ocorrencia(rid)))
+            except ValueError:
+                pass
+    saida = []
+    for ev in brutos:
+        if ev.get("STATUS", ({}, ""))[1].upper() == "CANCELLED" or "DTSTART" not in ev:
+            continue
+        try:
+            inicio = _ics_data(ev["DTSTART"][1], ev["DTSTART"][0])
+            dia_inteiro = not isinstance(inicio, dt.datetime)
+            inicio = _como_datetime(inicio)
+            if "DTEND" in ev:
+                duracao = _como_datetime(_ics_data(ev["DTEND"][1], ev["DTEND"][0])) - inicio
+            elif "DURATION" in ev:
+                duracao = _ics_duracao(ev["DURATION"][1])
+            else:
+                duracao = dt.timedelta(days=1) if dia_inteiro else dt.timedelta(0)
+        except ValueError:
+            continue
+        duracao = max(duracao, dt.timedelta(0))
+        uid = ev.get("UID", ({}, ""))[1]
+        excecoes = {_chave_ocorrencia(x) for x in ev["EXDATE"]}
+        repete = "RRULE" in ev and "RECURRENCE-ID" not in ev
+        ocorrencias = _expandir_rrule(inicio, ev["RRULE"][1], fim_dt) if repete else [inicio]
+        for o in ocorrencias:
+            chave = _chave_ocorrencia(o)
+            if chave in excecoes or (repete and (uid, chave) in sobrescritos):
+                continue
+            if o > fim_dt or (o < ini_dt and o + duracao <= ini_dt):
+                continue
+            saida.append({"inicio": o, "fim": o + duracao, "dia_inteiro": dia_inteiro,
+                          "titulo": _ics_texto(ev.get("SUMMARY", ({}, "(sem título)"))[1]).strip() or "(sem título)",
+                          "local": _ics_texto(ev.get("LOCATION", ({}, ""))[1]).strip()})
+    return saida
+
+
+def baixar_ics(url):
+    url = url.strip()
+    if url.lower().startswith("webcal://"):
+        url = "https://" + url[9:]
+    req = urllib.request.Request(url, headers={"User-Agent": "Daily/1.0"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+
+def _faixa_horario(e, dia):
+    ini, fim = e["inicio"], e["fim"]
+    if e["dia_inteiro"]:
+        return "Dia inteiro"
+    ultimo_dia = (fim - dt.timedelta(seconds=1)).date() if fim > ini else ini.date()
+    if ini.date() == dia and ultimo_dia == dia:
+        return f"{ini:%H:%M}" if fim <= ini else f"{ini:%H:%M} – {fim:%H:%M}"
+    if ini.date() == dia:
+        return f"a partir das {ini:%H:%M}"
+    if ultimo_dia == dia:
+        return f"até {fim:%H:%M}"
+    return "Dia inteiro"
+
+
+class Google:
+    """Lê as agendas do Google pelo endereço secreto iCal (somente leitura)."""
+
+    MINUTOS = 15
+    MINUTOS_ERRO = 2
+
+    def __init__(self, app):
+        self.app = app
+        self.por_dia = {}
+        self.status = {}
+        self.ultima = None
+        self.rodando = False
+        self._pendente = False
+        self._timer = None
+
+    @property
+    def agendas(self):
+        return self.app.store.config.setdefault("google", [])
+
+    def do_dia(self, iso):
+        return self.por_dia.get(iso, [])
+
+    def sincronizar(self):
+        if self.rodando:
+            self._pendente = True
+            return
+        if self._timer:
+            self.app.root.after_cancel(self._timer)
+            self._timer = None
+        agendas = [dict(a) for a in self.agendas]
+        if not agendas:
+            self.por_dia, self.status = {}, {}
+            self.app.store.notificar()
+            return
+        self.rodando = True
+        self.app.store.notificar()
+        threading.Thread(target=self._trabalho, args=(agendas,), daemon=True).start()
+
+    def _trabalho(self, agendas):
+        h = hoje()
+        ini, fim = h - dt.timedelta(days=62), h + dt.timedelta(days=400)
+        novos, status, falhas = {}, {}, set()
+        for a in agendas:
+            try:
+                evs = eventos_ics(baixar_ics(a["url"]), ini, fim)
+                status[a["url"]] = f"{len(evs)} evento{'s' if len(evs) != 1 else ''}"
+            except urllib.error.HTTPError as e:
+                status[a["url"]] = "Link inválido ou redefinido" if e.code in (403, 404) else f"Erro HTTP {e.code}"
+                falhas.add(a["url"])
+                continue
+            except (urllib.error.URLError, OSError):
+                status[a["url"]] = "Sem conexão — tentando de novo em breve"
+                falhas.add(a["url"])
+                continue
+            except Exception as e:
+                status[a["url"]] = f"Erro ao ler: {e}"[:80]
+                falhas.add(a["url"])
+                continue
+            for e in evs:
+                e.update(agenda=a["nome"], cor=a["cor"], url=a["url"])
+                ultimo = (e["fim"] - dt.timedelta(seconds=1)).date() if e["fim"] > e["inicio"] else e["inicio"].date()
+                d = max(e["inicio"].date(), ini)
+                while d <= min(ultimo, fim):
+                    novos.setdefault(d.isoformat(), []).append(dict(e, faixa=_faixa_horario(e, d)))
+                    d += dt.timedelta(days=1)
+        self.app.fila.put(("google", novos, status, falhas))
+
+    def receber(self, novos, status, falhas):
+        self.rodando = False
+        # agenda que falhou mantém os eventos da última leitura boa
+        for dia, evs in self.por_dia.items():
+            antigos = [e for e in evs if e["url"] in falhas]
+            if antigos:
+                novos.setdefault(dia, []).extend(antigos)
+        for evs in novos.values():
+            evs.sort(key=lambda e: (not e["dia_inteiro"], e["inicio"], e["titulo"].lower()))
+        self.por_dia, self.status, self.ultima = novos, status, dt.datetime.now()
+        self.app.store.notificar()
+        if self._pendente:
+            self._pendente = False
+            self.sincronizar()
+        else:
+            minutos = self.MINUTOS_ERRO if falhas else self.MINUTOS
+            self._timer = self.app.root.after(minutos * 60000, self.sincronizar)
+
+
+# --------------------------------------------------- atualização pelo GitHub
+
+def _versao_tupla(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3]) or (0,)
+
+
+def _caminho_novo():
+    return sys.executable + ".novo"
+
+
+def limpar_versoes_antigas():
+    pasta, nome = os.path.split(sys.executable)
+    for arq in os.listdir(pasta):
+        if arq.lower().startswith(nome.lower() + ".old") or arq.lower() == nome.lower() + ".novo.part":
+            try:
+                os.remove(os.path.join(pasta, arq))
+            except OSError:
+                pass  # a versão antiga ainda pode estar fechando; tenta de novo depois
+
+
+def instalar_e_reiniciar(args):
+    """Troca o .exe pelo .novo e abre a versão nova. O Windows permite renomear um .exe em uso."""
+    exe, novo = sys.executable, _caminho_novo()
+    if not os.path.exists(novo):
+        return False
+    velho = f"{exe}.old{os.getpid()}"
+    try:
+        os.replace(exe, velho)
+    except OSError:
+        return False
+    try:
+        os.replace(novo, exe)
+    except OSError:
+        os.replace(velho, exe)
+        return False
+    env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")  # o filho extrai os próprios arquivos
+    subprocess.Popen([exe] + list(args), env=env, close_fds=True,
+                     creationflags=0x00000008 | 0x00000200)  # DETACHED_PROCESS | NEW_PROCESS_GROUP
+    return True
+
+
+class Atualizador:
+    HORAS = 6
+
+    def __init__(self, app):
+        self.app = app
+        self.verificando = False
+        self._timer = None
+
+    def verificar(self, manual=False):
+        if self.verificando:
+            return
+        if self._timer:
+            self.app.root.after_cancel(self._timer)
+            self._timer = None
+        self.verificando = True
+        threading.Thread(target=self._trabalho, args=(manual,), daemon=True).start()
+
+    def _trabalho(self, manual):
+        try:
+            req = urllib.request.Request(URL_RELEASES, headers={
+                "Accept": "application/vnd.github+json", "User-Agent": "Daily"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                rel = json.load(r)
+            tag = rel.get("tag_name", "")
+            asset = next((a for a in rel.get("assets", []) if a.get("name", "").lower() == NOME_ASSET.lower()), None)
+            if _versao_tupla(tag) <= _versao_tupla(VERSAO):
+                resultado = ("atual", tag)
+            elif asset is None:
+                resultado = ("erro", f"A release {tag} não tem o arquivo {NOME_ASSET}.")
+            elif not EMPACOTADO:
+                resultado = ("disponivel", tag)
+            else:
+                self._baixar(asset)
+                resultado = ("baixada", tag)
+        except urllib.error.HTTPError as e:
+            resultado = ("atual", VERSAO) if e.code == 404 else ("erro", f"GitHub respondeu {e.code}.")
+        except Exception as e:
+            resultado = ("erro", str(e) or e.__class__.__name__)
+        self.app.fila.put(("atualizacao", resultado, manual))
+
+    def _baixar(self, asset):
+        destino = _caminho_novo()
+        parcial = destino + ".part"
+        h, total = hashlib.sha256(), 0
+        req = urllib.request.Request(asset["browser_download_url"], headers={"User-Agent": "Daily"})
+        with urllib.request.urlopen(req, timeout=60) as r, open(parcial, "wb") as f:
+            while True:
+                bloco = r.read(1 << 16)
+                if not bloco:
+                    break
+                f.write(bloco)
+                h.update(bloco)
+                total += len(bloco)
+        try:
+            if asset.get("size") and total != asset["size"]:
+                raise ValueError("download incompleto")
+            digest = asset.get("digest") or ""
+            if digest.startswith("sha256:") and digest[7:].lower() != h.hexdigest():
+                raise ValueError("o arquivo baixado não confere (hash diferente)")
+        except ValueError:
+            os.remove(parcial)
+            raise
+        os.replace(parcial, destino)
+
+    def receber(self, resultado, manual):
+        self.verificando = False
+        tipo, info = resultado
+        pai = self.app.janela if self.app.janela is not None and self.app.janela.winfo_exists() else None
+        if tipo == "baixada":
+            if messagebox.askyesno(APP_NOME, f"A versão {info} do Daily foi baixada.\n\n"
+                                   "Reiniciar agora para atualizar?\n"
+                                   "(Se escolher Não, ela será instalada na próxima vez que o Daily abrir.)",
+                                   parent=pai):
+                self.app.reiniciar_para_atualizar = True
+                self.app.sair()
+                return
+        elif manual and tipo == "disponivel":
+            messagebox.showinfo(APP_NOME, f"Existe a versão {info} no GitHub.\n"
+                                "Rodando como script, atualize com git pull.", parent=pai)
+        elif manual and tipo == "atual":
+            messagebox.showinfo(APP_NOME, f"Você já está na versão mais recente ({VERSAO}).", parent=pai)
+        elif manual and tipo == "erro":
+            messagebox.showerror(APP_NOME, f"Não foi possível verificar atualizações:\n{info}", parent=pai)
+        self._timer = self.app.root.after(self.HORAS * 3600 * 1000, self.verificar)
 
 
 # ---------------------------------------------------------------- dados (txt)
@@ -568,6 +1040,33 @@ class CartaoTarefa(tk.Frame):
             app.store.remover(t["id"])
 
 
+class CartaoEvento(tk.Frame):
+    """Evento vindo do Google Agenda (somente leitura)."""
+
+    def __init__(self, master, e):
+        card = COR["card"]
+        super().__init__(master, bg=card, highlightthickness=1, highlightbackground=COR["borda"])
+        tk.Frame(self, bg=e["cor"], width=S(4)).pack(side="left", fill="y")
+        meio = tk.Frame(self, bg=card, padx=S(10), pady=S(7))
+        meio.pack(side="left", fill="x", expand=True)
+        passou = not e["dia_inteiro"] and e["fim"] < dt.datetime.now()
+        titulo = tk.Label(meio, text=e["titulo"], bg=card, anchor="w", justify="left",
+                          font=(FONTE, 10, "bold"), fg=COR["fraco"] if passou else COR["texto"])
+        titulo.pack(fill="x")
+        meta = tk.Frame(meio, bg=card)
+        meta.pack(fill="x")
+        tk.Label(meta, text=e["faixa"], bg=card, fg=COR["suave"], font=(FONTE, 9)).pack(side="left")
+        tk.Label(meta, text=f"● {e['agenda']}", bg=card, fg=e["cor"],
+                 font=(FONTE, 9, "bold")).pack(side="left", padx=(S(8), 0))
+        rotulos = [titulo]
+        if e.get("local"):
+            local = tk.Label(meio, text=e["local"], bg=card, fg=COR["suave"], font=(FONTE, 8),
+                             anchor="w", justify="left")
+            local.pack(fill="x")
+            rotulos.append(local)
+        meio.bind("<Configure>", lambda ev: [r.configure(wraplength=max(50, ev.width - 4)) for r in rotulos])
+
+
 # ---------------------------------------------------------------- vista agenda
 
 class VistaAgenda(tk.Frame):
@@ -686,9 +1185,19 @@ class VistaAgenda(tk.Frame):
                                      fg=COR["texto"] if no_mes else COR["fraco"])
             for w in cel["chips"].winfo_children():
                 w.destroy()
-            ts = idx.get(d.isoformat(), [])
-            mostrar = ts if len(ts) <= max_chips else ts[:max_chips - 1]
-            for t in mostrar:
+            itens = [("e", e) for e in self.app.google.do_dia(d.isoformat())] + \
+                    [("t", t) for t in idx.get(d.isoformat(), [])]
+            mostrar = itens if len(itens) <= max_chips else itens[:max_chips - 1]
+            for tipo, t in mostrar:
+                if tipo == "e":
+                    hora = "" if t["dia_inteiro"] or t["inicio"].date() != d else f"{t['inicio']:%H:%M} "
+                    lb = tk.Label(cel["chips"], text=encurtar(hora + t["titulo"], max_chars),
+                                  bg=misturar(t["cor"], "#ffffff", .82), fg=misturar(t["cor"], "#000000", .3),
+                                  font=(FONTE, 8), anchor="w", padx=S(4), cursor="hand2")
+                    lb.pack(fill="x", pady=(0, S(2)))
+                    lb.bind("<Button-1>", lambda e, i=i: self._clicar(i))
+                    lb.bind("<Double-Button-1>", lambda e, i=i: self._novo(i))
+                    continue
                 cor = store.cor(t.get("categoria", ""))
                 if t["status"] == "concluida":
                     cbg, cfg, fonte = misturar(cor, "#ffffff", .6), misturar(cor, "#000000", .35), (FONTE, 8, "overstrike")
@@ -700,7 +1209,7 @@ class VistaAgenda(tk.Frame):
                               font=fonte, anchor="w", padx=S(4), cursor="hand2")
                 lb.pack(fill="x", pady=(0, S(2)))
                 lb.bind("<Button-1>", lambda e, t=t: self.app.editar(t))
-            resto = len(ts) - len(mostrar)
+            resto = len(itens) - len(mostrar)
             if resto:
                 mais = tk.Label(cel["chips"], text=f"+{resto}", bg=bg, fg=COR["suave"],
                                 font=(FONTE, 8, "bold"), anchor="w")
@@ -713,22 +1222,38 @@ class VistaAgenda(tk.Frame):
             w.destroy()
         card = COR["card"]
         ts = self.app.store.por_data().get(self.sel.isoformat(), [])
+        evs = self.app.google.do_dia(self.sel.isoformat())
         tk.Label(p, text=data_extensa(self.sel), bg=card, fg=COR["texto"], font=(FONTE, 13, "bold"),
                  anchor="w", justify="left", wraplength=S(270)) \
             .pack(fill="x", padx=S(16), pady=(S(16), 0))
         feitas = sum(t["status"] == "concluida" for t in ts)
-        resumo = "Nenhuma tarefa" if not ts else \
-            f"{len(ts)} tarefa{'s' if len(ts) > 1 else ''} · {feitas} concluída{'s' if feitas != 1 else ''}"
+        partes = []
+        if evs:
+            partes.append(f"{len(evs)} evento{'s' if len(evs) > 1 else ''}")
+        if ts:
+            partes.append(f"{len(ts)} tarefa{'s' if len(ts) > 1 else ''}")
+            partes.append(f"{feitas} concluída{'s' if feitas != 1 else ''}")
+        resumo = " · ".join(partes) or "Nenhuma tarefa"
         tk.Label(p, text=resumo, bg=card, fg=COR["suave"], font=(FONTE, 9), anchor="w") \
             .pack(fill="x", padx=S(16))
         Botao(p, "+  Adicionar tarefa", lambda: self.app.nova_tarefa(self.sel)) \
             .pack(fill="x", padx=S(16), pady=(S(12), S(10)))
         lista = ScrollFrame(p, card)
         lista.pack(fill="both", expand=True, padx=(S(12), S(4)), pady=(0, S(12)))
-        if not ts:
+        if not ts and not evs:
             tk.Label(lista.interior, text="Clique duas vezes em um dia\npara adicionar rapidamente.",
                      bg=card, fg=COR["fraco"], font=(FONTE, 9), justify="center") \
                 .pack(pady=S(30))
+
+        def secao(texto):
+            tk.Label(lista.interior, text=texto, bg=card, fg=COR["suave"], font=(FONTE, 8, "bold"),
+                     anchor="w").pack(fill="x", pady=(S(6), S(2)))
+        if evs:
+            secao("GOOGLE AGENDA")
+            for e in evs:
+                CartaoEvento(lista.interior, e).pack(fill="x", pady=S(3), padx=(0, S(4)))
+            if ts:
+                secao("TAREFAS")
         for t in ts:
             CartaoTarefa(lista.interior, self.app, t, mostrar_data=False) \
                 .pack(fill="x", pady=S(3), padx=(0, S(4)))
@@ -1106,6 +1631,129 @@ class DialogoCategorias(tk.Toplevel):
             self.montar()
 
 
+class DialogoGoogle(tk.Toplevel):
+    AJUDA = ("No Google Agenda (computador): ⋮ ao lado da agenda → Configurações e compartilhamento "
+             "→ Integrar agenda → copie o \"Endereço secreto no formato iCal\".\n"
+             "Somente leitura: os eventos aparecem no Daily, mas o que você cria aqui não vai para o Google.")
+
+    def __init__(self, app):
+        super().__init__(app.janela)
+        self.app = app
+        self.title("Google Agenda")
+        self.configure(bg=COR["card"])
+        self.resizable(False, False)
+        self.transient(app.janela)
+        card = COR["card"]
+        c = tk.Frame(self, bg=card, padx=S(24), pady=S(18))
+        c.pack(fill="both", expand=True)
+        tk.Label(c, text="Google Agenda", bg=card, fg=COR["texto"], font=(FONTE, 15, "bold"),
+                 anchor="w").pack(fill="x")
+        tk.Label(c, text=self.AJUDA, bg=card, fg=COR["suave"], font=(FONTE, 9), anchor="w",
+                 justify="left", wraplength=S(520)).pack(fill="x", pady=(S(4), S(12)))
+
+        self.lista = tk.Frame(c, bg=card)
+        self.lista.pack(fill="x")
+
+        tk.Label(c, text="ADICIONAR AGENDA", bg=card, fg=COR["suave"], font=(FONTE, 8, "bold"),
+                 anchor="w").pack(fill="x", pady=(S(16), S(4)))
+        linha = tk.Frame(c, bg=card)
+        linha.pack(fill="x")
+        self.cor_nova = PALETA[(len(app.google.agendas) + 2) % len(PALETA)]
+        self.amostra = tk.Label(linha, text="", width=3, bg=self.cor_nova, cursor="hand2")
+        self.amostra.pack(side="left", fill="y", padx=(0, S(8)))
+        self.amostra.bind("<Button-1>", lambda e: self._cor_nova())
+        self.e_nome = Entrada(linha, "Nome (ex.: Pessoal)", width=18)
+        self.e_nome.pack(side="left", ipady=S(4))
+        self.e_url = Entrada(c, "https://calendar.google.com/calendar/ical/…/basic.ics", width=60)
+        self.e_url.pack(fill="x", ipady=S(4), pady=(S(6), 0))
+        self.e_url.bind("<Return>", lambda e: self._adicionar())
+        self.l_erro = tk.Label(c, text="", bg=card, fg=COR["perigo"], font=(FONTE, 9), anchor="w")
+        self.l_erro.pack(fill="x", pady=(S(4), 0))
+
+        rod = tk.Frame(c, bg=card)
+        rod.pack(fill="x", pady=(S(8), 0))
+        Botao(rod, "Adicionar", self._adicionar).pack(side="right")
+        Botao(rod, "Atualizar agora", app.google.sincronizar, bg=COR["clara"], fg=COR["primaria"],
+              hover=COR["clara_hover"]).pack(side="right", padx=(0, S(8)))
+        self.l_ultima = tk.Label(rod, text="", bg=card, fg=COR["fraco"], font=(FONTE, 9))
+        self.l_ultima.pack(side="left")
+
+        self.montar()
+        app.store.ouvintes.append(self.montar)
+        self.bind("<Destroy>", self._ao_fechar)
+        self.bind("<Escape>", lambda e: self.destroy())
+        posicionar(self, app.janela)
+        self.grab_set()
+
+    def _ao_fechar(self, e):
+        if e.widget is self and self.montar in self.app.store.ouvintes:
+            self.app.store.ouvintes.remove(self.montar)
+
+    def montar(self):
+        for w in self.lista.winfo_children():
+            w.destroy()
+        card = COR["card"]
+        g = self.app.google
+        if not g.agendas:
+            tk.Label(self.lista, text="Nenhuma agenda conectada.", bg=card, fg=COR["fraco"],
+                     font=(FONTE, 10), anchor="w").pack(fill="x")
+        for a in g.agendas:
+            linha = tk.Frame(self.lista, bg=card)
+            linha.pack(fill="x", pady=S(3))
+            amostra = tk.Label(linha, text="", width=3, bg=a["cor"], cursor="hand2")
+            amostra.pack(side="left", fill="y", padx=(0, S(10)))
+            amostra.bind("<Button-1>", lambda e, a=a: self._trocar_cor(a))
+            tk.Label(linha, text=a["nome"], bg=card, fg=COR["texto"], font=(FONTE, 11)).pack(side="left")
+            st = "Atualizando…" if g.rodando and a["url"] not in g.status else g.status.get(a["url"], "Aguardando…")
+            erro = not st[:1].isdigit() and st not in ("Atualizando…", "Aguardando…")
+            tk.Label(linha, text=f"  {st}", bg=card, fg=COR["perigo"] if erro else COR["fraco"],
+                     font=(FONTE, 9)).pack(side="left")
+            Botao(linha, "✕", lambda a=a: self._remover(a), bg=card, fg=COR["fraco"], hover="#fef2f2",
+                  fonte=(FONTE, 10), padx=6, pady=0).pack(side="right")
+        if g.rodando:
+            self.l_ultima.configure(text="Atualizando…")
+        elif g.ultima:
+            self.l_ultima.configure(text=f"Atualizado às {g.ultima:%H:%M}")
+
+    def _salvar(self):
+        self.app.store.salvar(notificar=False)
+        self.app.google.sincronizar()
+
+    def _trocar_cor(self, a):
+        cor = colorchooser.askcolor(a["cor"], parent=self, title="Cor da agenda")[1]
+        if cor:
+            a["cor"] = cor
+            self._salvar()
+
+    def _cor_nova(self):
+        cor = colorchooser.askcolor(self.cor_nova, parent=self, title="Cor da agenda")[1]
+        if cor:
+            self.cor_nova = cor
+            self.amostra.configure(bg=cor)
+
+    def _adicionar(self):
+        url = self.e_url.valor().strip()
+        nome = self.e_nome.valor().strip() or "Google"
+        if not re.match(r"(https?|webcal)://", url, re.I):
+            self.l_erro.configure(text="Cole o endereço iCal completo (começa com https://).")
+            return
+        if any(a["url"] == url for a in self.app.google.agendas):
+            self.l_erro.configure(text="Essa agenda já está conectada.")
+            return
+        self.l_erro.configure(text="")
+        self.app.google.agendas.append({"nome": nome, "url": url, "cor": self.cor_nova})
+        self.e_nome.definir("")
+        self.e_url.definir("")
+        self.cor_nova = PALETA[(len(self.app.google.agendas) + 2) % len(PALETA)]
+        self.amostra.configure(bg=self.cor_nova)
+        self._salvar()
+
+    def _remover(self, a):
+        if messagebox.askyesno("Remover agenda", f'Desconectar "{a["nome"]}"?', parent=self):
+            self.app.google.agendas.remove(a)
+            self._salvar()
+
+
 # ----------------------------------------------------------- janela principal
 
 class JanelaPrincipal(tk.Toplevel):
@@ -1130,6 +1778,8 @@ class JanelaPrincipal(tk.Toplevel):
         Botao(barra, "+  Nova tarefa", self.nova_tarefa).pack(side="right", padx=(S(8), S(24)))
         Botao(barra, "Categorias", lambda: DialogoCategorias(app), bg=COR["clara"],
               fg=COR["primaria"], hover=COR["clara_hover"]).pack(side="right")
+        Botao(barra, "Google Agenda", lambda: DialogoGoogle(app), bg=COR["clara"],
+              fg=COR["primaria"], hover=COR["clara_hover"]).pack(side="right", padx=(0, S(8)))
         tk.Frame(self, bg=COR["borda"], height=1).pack(fill="x")
 
         area = tk.Frame(self, bg=COR["bg"])
@@ -1178,6 +1828,7 @@ class JanelaPrincipal(tk.Toplevel):
 class Widget(tk.Toplevel):
     LARGURA = 310
     MAX_HOJE = 12
+    MAX_EVENTOS = 8
     MAX_ATRASADAS = 5
 
     def __init__(self, app):
@@ -1192,6 +1843,7 @@ class Widget(tk.Toplevel):
             pass
         self.var_topo = tk.BooleanVar(self, value=cfg.get("widget_topo", False))
         self.var_auto = tk.BooleanVar(self, value=autostart_ativo())
+        self.var_atualizar = tk.BooleanVar(self, value=cfg.get("atualizar_auto", True))
         self.attributes("-topmost", self.var_topo.get())
 
         card = COR["card"]
@@ -1230,7 +1882,12 @@ class Widget(tk.Toplevel):
                                   command=self._alternar_topo)
         self.menu.add_checkbutton(label="Iniciar com o Windows", variable=self.var_auto,
                                   command=self._alternar_auto)
+        self.menu.add_checkbutton(label="Atualizar automaticamente", variable=self.var_atualizar,
+                                  command=self._alternar_atualizar)
+        self.menu.add_command(label="Verificar atualizações",
+                              command=lambda: app.atualizador.verificar(manual=True))
         self.menu.add_separator()
+        self.menu.add_command(label=f"Daily {VERSAO}", state="disabled")
         self.menu.add_command(label="Sair do Daily", command=app.sair)
 
         self._x, self._y = self._posicao_inicial()
@@ -1298,6 +1955,10 @@ class Widget(tk.Toplevel):
             messagebox.showerror(APP_NOME, f"Não foi possível alterar a inicialização:\n{e}")
         self.var_auto.set(autostart_ativo())
 
+    def _alternar_atualizar(self):
+        self.app.store.config["atualizar_auto"] = self.var_atualizar.get()
+        self.app.store.salvar(notificar=False)
+
     def _menu(self, e):
         try:
             self.menu.tk_popup(e.x_root, e.y_root)
@@ -1329,9 +1990,17 @@ class Widget(tk.Toplevel):
                             if t["status"] == "aberta" and t.get("data") and t["data"] < hiso),
                            key=chave_ordem)
 
-        if not ts:
+        evs = self.app.google.do_dia(hiso)
+        if not ts and not evs:
             tk.Label(self.corpo, text="Nada agendado para hoje.", bg=card, fg=COR["fraco"],
                      font=(FONTE, 10), anchor="w").pack(fill="x", padx=S(14), pady=S(6))
+        if evs:
+            for e in evs[:self.MAX_EVENTOS]:
+                self._linha_evento(e)
+            if len(evs) > self.MAX_EVENTOS:
+                self._mais(len(evs) - self.MAX_EVENTOS, "agenda")
+            if ts:
+                tk.Frame(self.corpo, bg=COR["borda"], height=1).pack(fill="x", padx=S(14), pady=S(6))
         for t in ts[:self.MAX_HOJE]:
             self._linha(t)
         if len(ts) > self.MAX_HOJE:
@@ -1365,6 +2034,20 @@ class Widget(tk.Toplevel):
                      font=(FONTE, 9, "bold"), anchor="w", cursor="hand2")
         l.pack(fill="x", padx=S(14), pady=(S(2), 0))
         l.bind("<Button-1>", lambda e: self.app.abrir(vista))
+
+    def _linha_evento(self, e):
+        card = COR["card"]
+        passou = not e["dia_inteiro"] and e["fim"] < dt.datetime.now()
+        linha = tk.Frame(self.corpo, bg=card)
+        linha.pack(fill="x", padx=S(14), pady=S(3))
+        tk.Frame(linha, bg=e["cor"], width=S(4)).pack(side="left", fill="y", padx=(S(7), 0))
+        txt = tk.Frame(linha, bg=card)
+        txt.pack(side="left", fill="x", expand=True, padx=(S(15), 0))
+        tk.Label(txt, text=e["titulo"], bg=card, anchor="w", justify="left",
+                 wraplength=S(self.LARGURA - 70), font=(FONTE, 10),
+                 fg=COR["fraco"] if passou else COR["texto"]).pack(fill="x")
+        tk.Label(txt, text=f"{e['faixa']}  ● {e['agenda']}", bg=card, anchor="w", font=(FONTE, 8),
+                 fg=COR["fraco"] if passou else e["cor"]).pack(fill="x")
 
     def _linha(self, t, com_data=False):
         card = COR["card"]
@@ -1414,13 +2097,24 @@ class App:
         self.store = Store(ARQUIVO_DADOS)
         self.janela = None
         self._configurar_autostart()
+        self.fila = queue.Queue()
+        self.google = Google(self)
+        self.atualizador = Atualizador(self)
+        self.reiniciar_para_atualizar = False
+        if self.store.config.get("versao") != VERSAO:
+            self.store.config["versao"] = VERSAO
+            self.store.salvar(notificar=False)
 
         self.widget = Widget(self)
         self.store.ouvintes.append(self.widget.atualizar)
 
-        self.fila = queue.Queue()
         threading.Thread(target=self._escutar, daemon=True).start()
         self.root.after(300, self._ler_fila)
+        self.root.after(1500, self.google.sincronizar)
+        if self.store.config.get("atualizar_auto", True):
+            self.root.after(5000, self.atualizador.verificar)
+        if EMPACOTADO:
+            self.root.after(30000, limpar_versoes_antigas)
         if abrir_janela:
             self.abrir()
 
@@ -1462,8 +2156,13 @@ class App:
     def _ler_fila(self):
         try:
             while True:
-                if self.fila.get_nowait() == "abrir":
+                msg = self.fila.get_nowait()
+                if msg == "abrir":
                     self.abrir()
+                elif isinstance(msg, tuple) and msg[0] == "google":
+                    self.google.receber(*msg[1:])
+                elif isinstance(msg, tuple) and msg[0] == "atualizacao":
+                    self.atualizador.receber(*msg[1:])
         except queue.Empty:
             pass
         self.root.after(300, self._ler_fila)
@@ -1518,11 +2217,24 @@ def main():
             except OSError:
                 pass
         return
+    if EMPACOTADO:
+        limpar_versoes_antigas()
+        if os.path.exists(_caminho_novo()):
+            # atualização baixada antes: instala e abre a versão nova
+            servidor.close()
+            if instalar_e_reiniciar(sys.argv[1:]):
+                return
+            servidor = iniciar_servidor()
+            if servidor is None:
+                return
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
-    App(servidor, abrir_janela=not ao_ligar).rodar()
+    app = App(servidor, abrir_janela=not ao_ligar)
+    app.rodar()
+    if app.reiniciar_para_atualizar:
+        instalar_e_reiniciar([])
 
 
 if __name__ == "__main__":
