@@ -1,0 +1,24 @@
+# Dados locais do usuário
+dados.txt
+dados.txt.tmp
+dados.txt.corrompido
+erros.log
+
+# Build (gerados pelo build.bat)
+.venv-build/
+build/
+dist/
+*.spec
+daily.ico
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Sistema / editores
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
